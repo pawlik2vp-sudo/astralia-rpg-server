@@ -1,7 +1,7 @@
 {
-  "name": "margonem-mini-rpg-server",
+  "name": "astralia-rpg-server",
   "version": "1.0.0",
-  "description": "Lekki serwer online (czat + ranking) dla Margonem Mini-RPG. Zero zaleznosci zewnetrznych.",
+  "description": "Lekki serwer online (czat + ranking) dla Astralia RPG. Zero zaleznosci zewnetrznych.",
   "main": "server.js",
   "scripts": {
     "start": "node server.js"

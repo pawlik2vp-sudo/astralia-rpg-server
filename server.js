@@ -1,7 +1,7 @@
 #!/usr/bin/env node
 'use strict';
 /*
- * Margonem Mini-RPG -- lekki serwer "Online" (globalny czat + ranking graczy).
+ * Astralia RPG -- lekki serwer "Online" (globalny czat + ranking graczy).
  * Celowo ZERO zaleznosci zewnetrznych (tylko wbudowane moduly Node) -- dziala
  * samym `node server.js`, bez `npm install`, wiec latwo go wystawic na
  * dowolnym darmowym hostingu (Render/Railway/Fly.io) albo uruchomic lokalnie.
@@ -181,5 +181,5 @@ const server = http.createServer(async (req, res) => {
 });
 
 server.listen(PORT, () => {
-  console.log(`Margonem Mini-RPG online-server nasluchuje na porcie ${PORT}`);
+  console.log(`Astralia RPG online-server nasluchuje na porcie ${PORT}`);
 });
