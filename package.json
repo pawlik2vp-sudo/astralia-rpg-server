@@ -1,0 +1,13 @@
+{
+  "name": "margonem-mini-rpg-server",
+  "version": "1.0.0",
+  "description": "Lekki serwer online (czat + ranking) dla Margonem Mini-RPG. Zero zaleznosci zewnetrznych.",
+  "main": "server.js",
+  "scripts": {
+    "start": "node server.js"
+  },
+  "engines": {
+    "node": ">=18"
+  },
+  "license": "ISC"
+}
