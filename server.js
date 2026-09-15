@@ -24,6 +24,20 @@
  *   POST /api/logout                 -> { token } -> { ok }
  *   GET  /api/character?token=...    -> { character: {...} | null }
  *   POST /api/character              -> { token, character } -> { ok, updatedAt }
+ *
+ * Dom Aukcyjny (auction house) -- asynchroniczny handel miedzy graczami.
+ * Serwer nie zna semantyki przedmiotow (traktuje `item` jako nieprzezroczysty
+ * JSON, tak jak `character`), wiec dziala jak depozyt: sprzedajacy "wklada"
+ * przedmiot na serwer (znika z jego lokalnego ekwipunku), kupujacy odbiera go
+ * natychmiast w odpowiedzi na /buy, a zloto dla sprzedajacego czeka w
+ * `pendingGold` do odebrania przez /claim (bo gracz moze byc offline gdy ktos
+ * kupi jego przedmiot -- nie ma tu live-polaczenia miedzy graczami):
+ *   GET  /api/auction                -> { listings: [...] }  (aktywne oferty, max 200 najnowszych)
+ *   POST /api/auction/list           -> { token, item, price } -> { ok, listing }
+ *   POST /api/auction/buy            -> { token, listingId } -> { ok, item }
+ *   POST /api/auction/cancel         -> { token, listingId } -> { ok }  (przedmiot trafia do pendingItems)
+ *   GET  /api/auction/mine?token=... -> { myListings, pendingGold, pendingItems }
+ *   POST /api/auction/claim          -> { token } -> { ok, gold, items }  (zeruje pendingGold/pendingItems)
  */
 const http = require('http');
 const fs = require('fs');
@@ -37,6 +51,7 @@ const CHAT_FILE = path.join(DATA_DIR, 'chat.json');
 const ACCOUNTS_FILE = path.join(DATA_DIR, 'accounts.json');
 const CHARACTERS_FILE = path.join(DATA_DIR, 'characters.json');
 const TOKENS_FILE = path.join(DATA_DIR, 'tokens.json');
+const AUCTIONS_FILE = path.join(DATA_DIR, 'auctions.json');
 
 const MAX_CHAT_MESSAGES = 300;
 const MAX_LEADERBOARD_ENTRIES = 500;
@@ -60,6 +75,7 @@ function ensureDataFiles() {
   if (!fs.existsSync(ACCOUNTS_FILE)) fs.writeFileSync(ACCOUNTS_FILE, '{}');
   if (!fs.existsSync(CHARACTERS_FILE)) fs.writeFileSync(CHARACTERS_FILE, '{}');
   if (!fs.existsSync(TOKENS_FILE)) fs.writeFileSync(TOKENS_FILE, '{}');
+  if (!fs.existsSync(AUCTIONS_FILE)) fs.writeFileSync(AUCTIONS_FILE, JSON.stringify({ listings: [], pendingGold: {}, pendingItems: {} }));
 }
 
 function readJson(file, fallback) {
@@ -152,6 +168,18 @@ let chatIdCounter = chat.length ? chat[chat.length - 1].id + 1 : 1;
 let accounts = readJson(ACCOUNTS_FILE, {}); // { usernameLower: { username, salt, hash, createdAt } }
 let characters = readJson(CHARACTERS_FILE, {}); // { usernameLower: { character, updatedAt } }
 let tokens = readJson(TOKENS_FILE, {}); // { token: usernameLower }
+let auctions = readJson(AUCTIONS_FILE, { listings: [], pendingGold: {}, pendingItems: {} });
+if (!auctions.listings) auctions.listings = [];
+if (!auctions.pendingGold) auctions.pendingGold = {};
+if (!auctions.pendingItems) auctions.pendingItems = {};
+let auctionIdCounter = auctions.listings.reduce((max, l) => Math.max(max, l.id), 0) + 1;
+
+const AUCTION_MAX_ACTIVE_PER_SELLER = 8;
+const AUCTION_MAX_TOTAL_LISTINGS = 500;
+const AUCTION_MIN_PRICE = 1;
+const AUCTION_MAX_PRICE = 50000000;
+const AUCTION_ITEM_MAX_BYTES = 4000;
+const AUCTION_PENDING_ITEMS_MAX = 40; // na gracza -- zabezpieczenie przed nieograniczonym magazynem, gdy ktos nie odbiera
 
 function usernameForToken(token) {
   if (typeof token !== 'string' || !token) return null;
@@ -167,7 +195,7 @@ const server = http.createServer(async (req, res) => {
 
   try {
     if (url.pathname === '/api/health' && req.method === 'GET') {
-      send(res, 200, { ok: true, players: Object.keys(leaderboard).length, messages: chat.length, accounts: Object.keys(accounts).length });
+      send(res, 200, { ok: true, players: Object.keys(leaderboard).length, messages: chat.length, accounts: Object.keys(accounts).length, auctionListings: auctions.listings.length });
       return;
     }
 
@@ -291,6 +319,101 @@ const server = http.createServer(async (req, res) => {
       characters[key] = { character: body.character, updatedAt };
       writeJson(CHARACTERS_FILE, characters);
       send(res, 200, { ok: true, updatedAt });
+      return;
+    }
+
+    if (url.pathname === '/api/auction' && req.method === 'GET') {
+      const list = auctions.listings.slice(-200).reverse();
+      send(res, 200, { listings: list });
+      return;
+    }
+
+    if (url.pathname === '/api/auction/list' && req.method === 'POST') {
+      if (isRateLimited(ip, 10, 60000)) { send(res, 429, { error: 'too many requests' }); return; }
+      const body = await readBody(req, AUCTION_ITEM_MAX_BYTES + 1000);
+      const key = usernameForToken(body.token);
+      if (!key) { send(res, 401, { error: 'invalid_token' }); return; }
+      const price = Math.round(Number(body.price));
+      if (!Number.isFinite(price) || price < AUCTION_MIN_PRICE || price > AUCTION_MAX_PRICE) { send(res, 400, { error: 'invalid_price' }); return; }
+      if (body.item === undefined || body.item === null || typeof body.item !== 'object') { send(res, 400, { error: 'missing_item' }); return; }
+      if (JSON.stringify(body.item).length > AUCTION_ITEM_MAX_BYTES) { send(res, 400, { error: 'item_too_large' }); return; }
+      const activeCount = auctions.listings.filter((l) => l.sellerKey === key).length;
+      if (activeCount >= AUCTION_MAX_ACTIVE_PER_SELLER) { send(res, 400, { error: 'too_many_listings' }); return; }
+      if (auctions.listings.length >= AUCTION_MAX_TOTAL_LISTINGS) { send(res, 400, { error: 'auction_house_full' }); return; }
+      const acct = accounts[key];
+      const listing = {
+        id: auctionIdCounter++,
+        sellerKey: key,
+        sellerNick: acct ? acct.username : key,
+        item: body.item,
+        price,
+        createdAt: Date.now(),
+      };
+      auctions.listings.push(listing);
+      writeJson(AUCTIONS_FILE, auctions);
+      send(res, 200, { ok: true, listing });
+      return;
+    }
+
+    if (url.pathname === '/api/auction/buy' && req.method === 'POST') {
+      if (isRateLimited(ip, 10, 60000)) { send(res, 429, { error: 'too many requests' }); return; }
+      const body = await readBody(req, 500);
+      const key = usernameForToken(body.token);
+      if (!key) { send(res, 401, { error: 'invalid_token' }); return; }
+      const listingId = Math.round(Number(body.listingId));
+      const idx = auctions.listings.findIndex((l) => l.id === listingId);
+      if (idx === -1) { send(res, 404, { error: 'listing_not_found' }); return; }
+      const listing = auctions.listings[idx];
+      if (listing.sellerKey === key) { send(res, 400, { error: 'cannot_buy_own_listing' }); return; }
+      auctions.listings.splice(idx, 1);
+      auctions.pendingGold[listing.sellerKey] = (auctions.pendingGold[listing.sellerKey] || 0) + listing.price;
+      writeJson(AUCTIONS_FILE, auctions);
+      send(res, 200, { ok: true, item: listing.item });
+      return;
+    }
+
+    if (url.pathname === '/api/auction/cancel' && req.method === 'POST') {
+      if (isRateLimited(ip, 10, 60000)) { send(res, 429, { error: 'too many requests' }); return; }
+      const body = await readBody(req, 500);
+      const key = usernameForToken(body.token);
+      if (!key) { send(res, 401, { error: 'invalid_token' }); return; }
+      const listingId = Math.round(Number(body.listingId));
+      const idx = auctions.listings.findIndex((l) => l.id === listingId);
+      if (idx === -1) { send(res, 404, { error: 'listing_not_found' }); return; }
+      const listing = auctions.listings[idx];
+      if (listing.sellerKey !== key) { send(res, 403, { error: 'not_your_listing' }); return; }
+      auctions.listings.splice(idx, 1);
+      if (!auctions.pendingItems[key]) auctions.pendingItems[key] = [];
+      if (auctions.pendingItems[key].length < AUCTION_PENDING_ITEMS_MAX) auctions.pendingItems[key].push(listing.item);
+      writeJson(AUCTIONS_FILE, auctions);
+      send(res, 200, { ok: true });
+      return;
+    }
+
+    if (url.pathname === '/api/auction/mine' && req.method === 'GET') {
+      const token = url.searchParams.get('token');
+      const key = usernameForToken(token);
+      if (!key) { send(res, 401, { error: 'invalid_token' }); return; }
+      const myListings = auctions.listings.filter((l) => l.sellerKey === key);
+      send(res, 200, {
+        myListings,
+        pendingGold: auctions.pendingGold[key] || 0,
+        pendingItems: auctions.pendingItems[key] || [],
+      });
+      return;
+    }
+
+    if (url.pathname === '/api/auction/claim' && req.method === 'POST') {
+      if (isRateLimited(ip, 10, 60000)) { send(res, 429, { error: 'too many requests' }); return; }
+      const body = await readBody(req, 500);
+      const key = usernameForToken(body.token);
+      if (!key) { send(res, 401, { error: 'invalid_token' }); return; }
+      const gold = auctions.pendingGold[key] || 0;
+      const items = auctions.pendingItems[key] || [];
+      delete auctions.pendingGold[key];
+      delete auctions.pendingItems[key];
+      writeJson(AUCTIONS_FILE, auctions);
+      send(res, 200, { ok: true, gold, items });
       return;
     }
 
